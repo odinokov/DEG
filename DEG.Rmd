@@ -1,0 +1,1148 @@
+---
+title: "`r params$set_title`"
+subtitle: "`r params$set_sub_title`"
+author: "Denis Odinokov"
+date: "March 11, 2020"
+output:
+  html_document:
+    theme: cerulean
+  pdf_document: default
+  word_document: default
+params:
+  set_title: "The pipeline of differential gene expression (DEG) analysis of samples obtained from 6 week and 12 months mice"
+  set_sub_title: "Draft: v3"
+abstract: | 
+  "The aim of this notebook is to identify DEGs in scRNA-seq data obtained from the 3 mice at their age of 6 weeks and 12 months and conduct the selected genes GO enrichment analysis." 
+---
+
+<!-- "Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file). 
+
+# uncomment to install pdf printer if needed: 
+# tinytex:::install_prebuilt()"
+-->
+
+# Intro
+
+"The follwing datasets are examined:
+
+  * immature (germinal vesicle or GV) mice oocytes (labeled as GV-6wk and GV-12),
+  
+  * MII-stage oocytes collected for in vitro maturation (labeled as IVM-MII-6wk and IVM-MII-12m),
+  
+  * MII-stage oocytes after in vivo maturation (labeled as MII-6wk and MII-12m).
+  
+The raw scRNA-seq read counts aligning and quantification were conducted by Professor Lee Tin-Lap and research associates, and the data are stored as tab-separated value files (each of which contains 47,069 records) with the following headings: gene identifier, transcript identification, length, effective length, expected count, TPM (transcripts per million), and FPKM (fragments per kilobase million)."
+ 
+## Setting up
+
+"Clean up R environment, load required libraries with `pacman` and set working directory with the results of the experiment saved in separate folders:"
+```{r setup, include=TRUE}
+
+# Clean up R environment
+rm(list = ls(all = TRUE))
+
+if (!require(pacman))
+  install.packages("pacman")
+library(pacman)
+
+# Load required libraries with `pacman`
+pacman::p_load(
+  "knitr",
+  "magrittr",
+  "DESeq2",
+  "tidyverse",
+  # "htmltools",
+  "janitor",
+  "dplyr",
+  "fs",
+  "ggplot2",
+  "DescTools",
+  "biomaRt",
+  "RColorBrewer",
+  "pheatmap",
+  "DT",
+  "kableExtra",
+  "M3C",
+  "ggfortify",
+  "vsn",
+  "hexbin"
+  #"stat_binhex"
+  # "venn",
+  # "rAverage"
+)
+
+# Set working directory
+PATH = ".../IVM data for Denis/" %>%
+  normalizePath()
+
+knitr::opts_chunk$set(
+	echo = TRUE,
+	warning = TRUE,
+	bootstrap.show.code = FALSE
+)
+knitr::opts_knit$set(root.dir = PATH)
+```
+
+## Loading data
+
+"The function to load files from folder, clean and merge into a dataframe:"
+```{r}
+
+fls2tbl <- function(dataPath) {
+  
+  keepColumns <- c("expected_count", "TPM", "FPKM")
+  
+  tbl <-
+    paste0(dataPath, list.files(path = dataPath, pattern = "*.results")) %>%
+    map( ~ read_tsv(.)[, c("gene_id", keepColumns)] %>%
+           `colnames<-`(c(
+             "gene_id", paste(keepColumns, path_file(dataPath), sep = "_")
+           ))) %>%
+    # merge on "gene_id" column
+    Reduce(function(x, y)
+      merge(x, y, by = "gene_id"), .) %>%
+    # drop duplicated columns
+    .[!duplicated(unclass(.))] %>%
+    # clean the column names
+    clean_names(.)
+  (tbl)
+}
+```
+
+"The function to round all numerical values in a dataframe:"
+```{r}
+
+round_df <- function(df, digits = 0) {
+  nums <- vapply(df, is.numeric, FUN.VALUE = logical(1))
+  df[, nums] <- round(df[, nums], digits = digits)
+  (df)
+}
+```
+
+"Load the data from folders into a single dataframe:"
+```{r message=FALSE, warning=FALSE}
+
+merged_tbl <-
+  Reduce(
+    function(x, y)
+      merge(x = x, y = y, by = "gene_id"),
+    list(
+      './GV-6wk/' %>% fls2tbl() %>% round_df(),
+      './GV-12m/' %>% fls2tbl() %>% round_df(),
+      './MII-6wk/' %>% fls2tbl() %>% round_df(),
+      './MII-12m/' %>% fls2tbl() %>% round_df(),
+      './IVM-MII-6wk/' %>% fls2tbl() %>% round_df(),
+      './IVM-MII-12m/' %>% fls2tbl() %>% round_df()
+    )
+  )
+```
+
+# Data exploratory analysis (quality control)
+
+
+## Data cleaning
+
+"Keep genes if FPKM (pseudo-counts) represented at least 1 read in at least in 2 samples:"
+```{r}
+
+merged_tbl_cleaned <-
+  merged_tbl[(merged_tbl[, grep("fpkm", colnames(merged_tbl))] > 1) %>%
+               rowSums(.) >= 2, ]
+
+# gene names as index
+rownames(merged_tbl_cleaned) <-
+  merged_tbl_cleaned[, "gene_id"]
+```
+
+"Prepare the data frame with normalized values (FPKM) and expressed genes for initial analysis and visualization:"
+```{r}
+
+# df is a temporary data frame for various needs
+df <-
+  merged_tbl_cleaned[, grep("fpkm", colnames(merged_tbl_cleaned))] %>%
+  # .[rowSums(.) > 0, ] %>% # drop zero expressed genes
+  # mutate_all(as.numeric) %>%
+  t(.)
+
+mapping <-
+  sapply(setNames(
+    c(
+      "fpkm_ivm_mii_6wk",
+      "fpkm_ivm_mii_12m",
+      "fpkm_mii_6wk",
+      "fpkm_mii_12m",
+      "fpkm_gv_6wk",
+      "fpkm_gv_12m"
+    ),
+    c("IVM 6wk", "IVM 12m", "MII 6wk", "MII 12m", "GV 6wk", "GV 12m")
+  ), grepl, rownames(df))
+
+sample_names <-
+  colnames(mapping)[which(mapping, arr.ind = TRUE)[, "col"]]
+```
+
+## PCA of FPKM values
+
+"Assume linear dependencies among values."
+
+```{r}
+
+pca <-
+  prcomp(df, scale. = TRUE)
+```
+
+"Plot PCA of FPKM of all samples:"
+```{r}
+
+autoplot(pca, label = FALSE, size = 5, alpha = 0.8) + aes(color = sample_names) + scale_color_manual(
+  values = c(
+    "steelblue1",
+    "steelblue3",
+    "orchid1",
+    "orchid3",
+    "lightsalmon1",
+    "lightsalmon3"
+  )
+) + ggtitle("PCA of FPKM values") + theme(plot.title = element_text(hjust = 0.5)) + guides(color=guide_legend(title="Samples:")) 
+```
+
+## UMAP of FPKM values
+
+"Assume non-linear dependencies among values."
+
+```{r}
+
+umap(
+  t(df %>% as.data.frame() %>% mutate_all(scale)), # scale the data
+  labels = as.factor(sample_names),
+  controlscale = TRUE,
+  scale = 3
+) + scale_color_manual(
+  values = c(
+    "steelblue1",
+    "steelblue3",
+    "orchid1",
+    "orchid3",
+    "lightsalmon1",
+    "lightsalmon3"
+  )
+)  + ggtitle("UMAP of FPKM values") + theme(plot.title = element_text(hjust = 0.5)) + guides(color=guide_legend(title="Samples:")) 
+```
+## t-distributed stochastic neighbor embedding of FMPK
+```{r}
+tsne(
+  t(df %>% as.data.frame() %>% mutate_all(scale)), # scale the data
+  K = FALSE, labels = as.factor(sample_names), perplex = 5, printres = FALSE, seed = 42) + scale_color_manual(
+  values = c(
+    "steelblue1",
+    "steelblue3",
+    "orchid1",
+    "orchid3",
+    "lightsalmon1",
+    "lightsalmon3"
+  )
+)  + ggtitle("t-SNE of FPKM values") + theme(plot.title = element_text(hjust = 0.5)) + guides(color=guide_legend(title="Samples:")) 
+```
+
+## Multidimensional Scaling (MDS)
+
+"Assume non-linear dependencies among values."
+```{r}
+
+pacman::p_load("smacof", "scales")
+
+# rescale values between 0 and 1
+mds <- mds(delta = df %>% as.data.frame() %>% mutate_all(rescale), ndim = 2, type = "ratio")
+
+ggplot() + geom_point(
+  data = as.data.frame(mds$conf),
+  mapping = aes(x = -D1, y = -D2),
+  size = 5, alpha = 0.8
+) + aes(color = sample_names)  + scale_color_manual(
+  values = c(
+    "steelblue1",
+    "steelblue3",
+    "orchid1",
+    "orchid3",
+    "lightsalmon1",
+    "lightsalmon3"
+  )
+) +  ggtitle("MDS of FPKM values") + theme(plot.title = element_text(hjust = 0.5)) + guides(color=guide_legend(title="Samples:")) 
+```
+
+## Checking the normality of expected counts
+
+"Load raw counts and check the variance across mean expression level"
+```{r}
+
+df_raw <-
+  merged_tbl_cleaned[, grep("expected_count", colnames(merged_tbl_cleaned))] %>%
+  .[rowSums(.) > 0, ] %>%
+  t(.)
+
+mean_counts <- apply(df_raw, 2, mean)
+variance_counts <- apply(df_raw, 2, var)
+
+mean_vs_variance <- data.frame(mean_counts, variance_counts)
+
+ggplot(mean_vs_variance) +
+  geom_point(aes(x = mean_counts, y = variance_counts)) +
+  geom_line(aes(x = mean_counts, y = mean_counts, color = "Mean expression level")) + 
+  labs(color = "") + scale_color_manual(values = "red") + 
+  scale_y_log10() +
+  scale_x_log10() + ggtitle("Raw counts mean vs. variance") + theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+## Outliers (DEG candidates) among expected counts
+
+"Conclusion: the data is required normalization within samples and between experiments"
+```{r}
+
+# check ourliers in all samples (z-scores) per gene, i.e. along the columns
+outliers_boolean <- df_raw %>% as.data.frame() %>% mutate_all(scale) %>% abs() > 3
+
+rownames(outliers_boolean) <- rownames(df_raw)
+
+
+barplot(
+  outliers_boolean %>% rowSums(),
+  las = 1,
+  main = "Samples vs the number of ouliers \n among expected counts between samples",
+  horiz = TRUE,
+  cex.names = 0.7,
+  
+  names.arg = as.factor(sample_names),
+  
+  col = c(rep("orchid", 6),
+          rep("lightsalmon", 6),
+          rep("steelblue", 6))
+)
+```
+
+## Raw counts normalization by DESeq2
+
+"Create a DESeqDataSet object:"
+```{r}
+
+metaData <-
+  data.frame("id" = rownames(df_raw), "dex" = NaN)
+
+dex_types <-
+  list(
+    "count_gv_6wk",
+    "count_gv_12m",
+    "count_mii_6wk",
+    "count_mii_12m",
+    "count_ivm_mii_6wk",
+    "count_ivm_mii_12m"
+  )
+
+for (dex in dex_types) {
+  metaData[grep(dex, metaData[, "id"]), "dex"] <- dex
+}
+
+countData <- cbind(data.frame("gene_id" = colnames(df_raw)), t(df_raw))
+
+rownames(countData) <- c()
+
+# Construct DESeqDataSet Object
+
+dds <- DESeqDataSetFromMatrix(
+  countData = countData,
+  colData = metaData,
+  design =  ~ dex,
+  tidy = TRUE
+)
+
+# run DESEQ function
+dds <- DESeq(dds)
+```
+
+"Get the normalized counts:"
+```{r}
+df_norm <- counts(dds, normalized=TRUE) %>% t
+
+rownames(df_norm) <- gsub("expected", "norm", rownames(df_norm))
+
+# Print the normalization factor applied to each sample 
+sizeFactors(dds)
+
+# knitr::kable(sizeFactors(dds),
+#              caption = "Size Factors:")  %>%
+#   kable_styling(bootstrap_options = "striped", full_width = F, font_size = 10)
+```
+
+## PCA of norm count
+
+"Assume linear dependencies among values."
+```{r}
+
+pca <-
+  prcomp(df_norm, scale. = TRUE)
+```
+
+"Plot PCA of FPKM of all samples:"
+```{r}
+
+autoplot(pca, label = FALSE, size = 5, alpha = 0.8) + aes(color = sample_names) + scale_color_manual(
+  values = c(
+    "steelblue1",
+    "steelblue3",
+    "orchid1",
+    "orchid3",
+    "lightsalmon1",
+    "lightsalmon3"
+  )
+) + ggtitle("PCA of normalized count") + theme(plot.title = element_text(hjust = 0.5)) + guides(color=guide_legend(title="Samples:")) 
+```
+## UMAP of norm count
+
+"Assume non-linear dependencies among values."
+```{r}
+
+umap(
+  t(df_norm %>% as.data.frame() %>% mutate_all(scale)), # scale the data
+  labels = as.factor(sample_names),
+  controlscale = TRUE,
+  scale = 3
+) + scale_color_manual(
+  values = c(
+    "steelblue1",
+    "steelblue3",
+    "orchid1",
+    "orchid3",
+    "lightsalmon1",
+    "lightsalmon3"
+  )
+)  + ggtitle("UMAP of normalized count") + theme(plot.title = element_text(hjust = 0.5)) + guides(color=guide_legend(title="Samples:")) 
+```
+
+## t-distributed stochastic neighbor embedding of norm count
+```{r}
+tsne(
+  t(df %>% as.data.frame() %>% mutate_all(scale)), # scale the data
+  K = FALSE, labels = as.factor(sample_names), perplex = 5, printres = FALSE, seed = 42) + scale_color_manual(
+  values = c(
+    "steelblue1",
+    "steelblue3",
+    "orchid1",
+    "orchid3",
+    "lightsalmon1",
+    "lightsalmon3"
+  )
+)  + ggtitle("t-SNE of normalized count") + theme(plot.title = element_text(hjust = 0.5)) + guides(color=guide_legend(title="Samples:")) 
+```
+
+## Multidimensional Scaling (MDS)
+
+"Assume non-linear dependencies among values."
+```{r}
+
+pacman::p_load("smacof", "scales")
+
+# rescale values between 0 and 1
+mds <- mds(delta = df_norm %>% as.data.frame() %>% mutate_all(rescale), ndim = 2, type = "ratio")
+
+ggplot() + geom_point(
+  data = as.data.frame(mds$conf),
+  mapping = aes(x = -D1, y = -D2),
+  size = 5, alpha = 0.8
+) + aes(color = sample_names)  + scale_color_manual(
+  values = c(
+    "steelblue1",
+    "steelblue3",
+    "orchid1",
+    "orchid3",
+    "lightsalmon1",
+    "lightsalmon3"
+  )
+) +  ggtitle("MDS of normalized count") + theme(plot.title = element_text(hjust = 0.5)) + guides(color=guide_legend(title="Samples:")) 
+```
+
+"Store factors:" 
+```{r}
+write.csv( as.data.frame(sizeFactors(dds)), file="DESeq2_sizeFactors.csv" )
+
+boxplot(as.data.frame(sizeFactors(dds)), main='The size factor across the samples')
+```
+ 
+"Compare function for the expected vs normalized counts:"
+```{r}
+
+compare <- function(data1, data2) {
+  summary1 <- apply(data1, 2, summary) %>% data.frame()
+  summary2 <- apply(data2, 2, summary) %>% data.frame()
+  
+  names(summary1) <- paste0(names(summary1), "1")
+  names(summary2) <- paste0(names(summary2), "2")
+  
+  final <- cbind(summary1, summary2)
+  
+  final1 <- t(final)
+  
+  final2 <- final1[order(row.names(final1)),]
+  
+  final_1 <- t(final2) %>% data.frame()
+  
+  (final_1)
+  
+}
+
+comparison <- t(compare(t(df_raw), t(df_norm))) %>% as.data.frame() %>% round_df() 
+```
+
+Print summary before and after the normalization:
+```{r}
+comparison_summary <- comparison[c(1,19,2,20,3,21,4,22,5,23,6,24,7,25,8,26,9,27,10,28,11,29,12,30,13,31,14,32,15,33,16,34,17,25,18,36),]
+
+write.csv(comparison_summary, file="DESeq2_comparison_summary.csv" )
+
+comparison_summary
+
+# knitr::kable(comparison[c(1,19,2,20,3,21,4,22,5,23,6,24,7,25,8,26,9,27,10,28,11,29,12,30,13,31,14,32,15,33,16,34,17,25,18,36),] ,
+#              caption = "Summary:")  %>%
+#   kable_styling(bootstrap_options = "striped", full_width = T, font_size = 10)
+```
+
+```{r}
+# this gives log2(n + 1)
+ntd <- normTransform(dds)
+meanSdPlot(assay(ntd))$gg + ggtitle("Standard Deviations Versus Means\n(the shifted logarithm transformation)") + theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r}
+vsd <- vst(dds, blind=FALSE)
+rld <- rlog(dds, blind=FALSE)
+```
+
+```{r}
+meanSdPlot(assay(vsd))$gg + ggtitle("Standard Deviations Versus Means\n(the regularized log transformation)") + theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r}
+meanSdPlot(assay(rld))$gg + ggtitle("Standard Deviations Versus Means\n(the variance stabilizing transformation)") + theme(plot.title = element_text(hjust = 0.5))
+```
+
+# DE analysis
+
+"DESeq2 will be used for the DE analysis"
+
+## Overview
+
+"Summary of differential gene expression:"
+```{r}
+
+res_tidy <- results(dds, pAdjustMethod="bonferroni", tidy = TRUE)
+res <- results(dds, pAdjustMethod="bonferroni")
+
+print(summary(res_tidy))
+```
+
+
+Sort summary list by p-value and save DEG results:
+```{r}
+res <- res[order(res$padj), ]
+
+write.csv( as.data.frame(res), file="DESeq2_all_samples.csv" )
+```
+
+## MA-plot
+
+```{r}
+plotMA(res, ylim=c(-12,12), main='The fold change versus mean of size-factor normalized counts')
+```
+
+## DEG visualization
+
+"Volcano Plot:"
+```{r}
+#reset par
+par(mfrow = c(1, 1))
+# Make a basic volcano plot
+with(res,
+     plot(
+       log2FoldChange,
+       -log10(pvalue),
+       pch = 20,
+       cex = .7,
+       main = "Volcano plot",
+       xlim = c(-10, 10)
+     ))
+
+# Add colored points
+with(subset(res, padj < .1),
+     points(
+       log2FoldChange,
+       -log10(pvalue),
+       pch = 20,
+       cex = .7,
+       col = "red"
+     ))
+with(
+  subset(res, padj < .05 &
+           abs(log2FoldChange) > 2),
+  points(
+    log2FoldChange,
+    -log10(pvalue),
+    pch = 20,
+    cex = .7,
+    col = "blue"
+  )
+)
+```
+
+## Heatmap
+
+"Compute pairwise correlation values and plot a heatmap:"
+```{r}
+rld_cor <- dds %>% rlog(., blind=T) %>% assay(.) %>% cor(.)
+rownames(rld_cor) <- colnames(rld_cor) <- sample_names
+pheatmap(rld_cor, border_color=NA, fontsize = 10, 
+  		fontsize_row = 10, main = "Pairwise correlation of samples")
+```
+
+"Hierarchical clustering of top-10 genes failed to predict correctly the samples types based on the DE genes expression profiles:"
+```{r}
+rld <- dds %>% rlog(., blind=T)
+
+# library("genefilter")
+topVarGenes <-
+  head(order(rowVars(assay(rld)), decreasing = TRUE), 10)
+
+rld_top <- assay(rld)[topVarGenes,]
+
+pheatmap(t(rld_top), scale = "row", border_color=NA, fontsize = 7, 
+  		fontsize_row = 7, main = "Hierarchical clustering of top-10 genes")
+
+```
+
+"How many genes are over or under expressed with an absolute `log2FoldChange` more than 2 and p-val less than 0.05?"
+```{r}
+
+sig_genes <- res_tidy %>% dplyr::filter(padj < 0.05 & abs(log2FoldChange) > 2)
+
+print(paste("Total:", nrow(sig_genes)))
+
+print(paste("Over:", nrow(res_tidy %>% dplyr::filter(padj < 0.05 & log2FoldChange > 2))))
+
+print(paste("Under:", nrow(res_tidy %>% dplyr::filter(padj < 0.05 & log2FoldChange < 2))))
+
+```
+
+"Moderated estimation of fold change and dispersion for RNA-seq data with DESeq2"
+```{r}
+
+plotDispEsts(dds, ylim = c(1e-4, 1e4), main = "Count over dispersion")
+```
+
+"P-values:"
+```{r}
+hist( res$pvalue, breaks=20, col="grey", main = "p-val over gene number")
+```
+
+```{r}
+hist( res$padj, breaks=20, col="grey", main = "Adjusted p-val over gene number")
+```
+
+## PCA of normalized count of DEG:
+```{r}
+
+pca <-
+  prcomp(df_norm[, colnames(df_norm) %in% sig_genes$row], scale. = TRUE)
+```
+
+"PCA of normalized values of DEG:"
+```{r}
+
+autoplot(pca, label = FALSE, size = 5, alpha = 0.8) + aes(color = sample_names) + scale_color_manual(
+  values = c(
+    "steelblue1",
+    "steelblue3",
+    "orchid1",
+    "orchid3",
+    "lightsalmon1",
+    "lightsalmon3"
+  )
+) + ggtitle("PCA of normalized values of DEG") + theme(plot.title = element_text(hjust = 0.5)) + guides(color=guide_legend(title="Samples:")) 
+```
+
+"UMAP of normalized values of DEG:"
+```{r}
+
+umap(
+  t(df_norm[, colnames(df_norm) %in% sig_genes$row] %>% as.data.frame() %>% mutate_all(scale)),
+  # scale the data
+  labels = as.factor(sample_names),
+  controlscale = TRUE,
+  scale = 3
+) + scale_color_manual(
+  values = c(
+    "steelblue1",
+    "steelblue3",
+    "orchid1",
+    "orchid3",
+    "lightsalmon1",
+    "lightsalmon3"
+  )
+)  + ggtitle("UMAP of normalized values of DEG") + theme(plot.title = element_text(hjust = 0.5)) + guides(color=guide_legend(title="Samples:")) 
+```
+
+"MDS of normalized values of DEG:"
+```{r}
+
+pacman::p_load("smacof", "scales")
+
+# rescale values between 0 and 1
+mds <- mds(delta = df_norm[, colnames(df_norm) %in% sig_genes$row] %>% as.data.frame() %>% mutate_all(rescale), ndim = 2, type = "ratio")
+
+ggplot() + geom_point(
+  data = as.data.frame(mds$conf),
+  mapping = aes(x = -D1, y = -D2),
+  size = 5, alpha = 0.8
+) + aes(color = sample_names)  + scale_color_manual(
+  values = c(
+    "steelblue1",
+    "steelblue3",
+    "orchid1",
+    "orchid3",
+    "lightsalmon1",
+    "lightsalmon3"
+  )
+) +  ggtitle("MDS of normalized values of DEG") + theme(plot.title = element_text(hjust = 0.5)) + guides(color=guide_legend(title="Samples:")) 
+```
+## t-distributed stochastic neighbor embedding of FMPK
+```{r}
+tsne(
+  t(df_norm[, colnames(df_norm) %in% sig_genes$row] %>% as.data.frame() %>% mutate_all(scale)), # scale the data
+  K = FALSE, labels = as.factor(sample_names), perplex = 5, printres = FALSE, seed = 42) + scale_color_manual(
+  values = c(
+    "steelblue1",
+    "steelblue3",
+    "orchid1",
+    "orchid3",
+    "lightsalmon1",
+    "lightsalmon3"
+  )
+)  + ggtitle("t-SNE of normalized values of DEG") + theme(plot.title = element_text(hjust = 0.5)) + guides(color=guide_legend(title="Samples:")) 
+```
+
+# GO enrichment analysis
+
+"Get common names for those genes:"
+```{r}
+# library("biomaRt")
+
+ensembl <- useMart("ensembl", dataset = "mmusculus_gene_ensembl", host="http://asia.ensembl.org/")
+
+annot <-
+  getBM(c("ensembl_gene_id", "mgi_symbol", "gene_biotype", "description", "entrezgene_id", "chromosome_name"), mart = ensembl)
+```
+
+"Sort genes for GO:"
+```{r}
+
+DESeqResult <- as.data.frame(res) 
+
+DESeqResult$ensembl_gene_id <- rownames(DESeqResult)
+
+DESeqResult <- DESeqResult %>% filter(padj < 0.05 & abs(log2FoldChange) > 2)
+
+DESeqResult <- merge(DESeqResult, annot, by= "ensembl_gene_id",  all.x = TRUE)
+
+DESeqResult <- DESeqResult[order(abs(DESeqResult$log2FoldChange), decreasing = TRUE),]
+
+write.csv(DESeqResult, file="DESeq2_all_samples_genenames_filtered_ordered.csv" )
+```
+
+
+"Check from which chromosomes those GE genes:"
+```{r}
+barplot(table(DESeqResult$chromosome_name)[order(table(DESeqResult$chromosome_name), decreasing = TRUE)], font.axis=1, cex.axis=1, las=2, main="Chromosomes vs DE genes", xlab="Chromosome", ylab="The number of DEG")
+```
+
+"hat are those gene types?"
+```{r}
+genome <- data.frame(table(DESeqResult$gene_biotype)/length(DESeqResult$gene_biotype))
+
+genome$Var1 <-  gsub("_", " ", genome$Var1)
+genome$Var1[which(genome$Var1 == "TEC")] <- "To Be Experimentally Confirmed"
+
+pacman::p_load("plotly")
+
+p <- plot_ly(genome, labels = ~Var1, values = ~Freq, type = 'pie',textposition = 'outside',textinfo = 'percent', rotation = 120) %>%
+  layout(title = 'DEG genome',
+         xaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE),
+         yaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE))
+
+p
+```
+
+"Loading libraries:"
+```{r}
+pacman::p_load(
+  "org.Mm.eg.db",
+  "DOSE",
+  "pathview",
+  "clusterProfiler",
+  "AnnotationHub",
+  "ensembldb",
+  "tidyverse"
+)
+```
+
+"Run GO enrichment analysis:"
+```{r}
+
+all_genes <- as.data.frame(res) %>% rownames()
+
+## Run GO enrichment analysis 
+ego <- enrichGO(gene = sig_genes$row, 
+                universe = all_genes,
+                keyType = "ENSEMBL",
+                OrgDb = org.Mm.eg.db, 
+                ont = "BP", 
+                pAdjustMethod = "BH", 
+                qvalueCutoff = 0.05, 
+                readable = TRUE)
+                
+## Output results from GO analysis to a table
+cluster_summary <- data.frame(ego)
+
+write.csv(cluster_summary, "clusterProfiler_types.csv")
+```
+
+## Visualizing clusterProfiler results
+
+```{r}
+barplot(ego, drop=TRUE, showCategory=25, font.size=9, order=TRUE) +
+        labs(y="Count", x="GO term", colour="p value", size="Count") + ggtitle("Top-25 GO processes") + theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+```{r}
+## Dotplot 
+dotplot(ego, showCategory=25, font.size=7, order=TRUE) +
+        labs(x="Hits", y="GO term", colour="p value", size="Count") + ggtitle("Enrichment Analysis using clusterPofiler") + theme(plot.title = element_text(hjust = 0.5))
+```
+
+"Enrichmap clusters the 25 most significant (by padj) GO terms to visualize relationships between terms:"
+```{r}
+a <- ego
+a@result$Description <- gsub(' ', '\n', a@result$Description)
+emapplot(a, showCategory = 25, color = "p.adjust", layout = "sugiyama", pie_scale=2) + ggtitle("Enrichmap clusters the TOP-25 GO terms") + theme(plot.title = element_text(hjust = 0.5)) + scale_y_discrete()
+```
+
+"Cnetplot details the genes associated with GO terms"
+```{r}
+OE_foldchanges <- DESeqResult$log2FoldChange
+names(OE_foldchanges) <- DESeqResult$ensembl_gene_id
+
+## Cnetplot details the genes associated with one or more terms - by default gives the top 5 significant terms (by padj)
+
+cnetplot(ego,
+         categorySize="pvalue",
+         showCategory = 2,
+         foldChange=OE_foldchanges,
+         vertex.label.font=1)
+```
+
+# REViGO can take long lists of Gene Ontology terms and summarize them by removing redundant GO terms 
+
+```{r}
+
+# A treemap R script produced by the REVIGO server at http://revigo.irb.hr/
+# If you found REVIGO useful in your work, please cite the following reference:
+# Supek F et al. "REVIGO summarizes and visualizes long lists of Gene Ontology
+# terms" PLoS ONE 2011. doi:10.1371/journal.pone.0021800
+
+# author: Anton Kratz <anton.kratz@gmail.com>, RIKEN Omics Science Center, Functional Genomics Technology Team, Japan
+# created: Fri, Nov 02, 2012  7:25:52 PM
+# last change: Fri, Nov 09, 2012  3:20:01 PM
+
+# -----------------------------------------------------------------------------
+# If you don't have the treemap package installed, uncomment the following line:
+# install.packages( "treemap" );
+library(treemap) 								# treemap package by Martijn Tennekes
+
+# Set the working directory if necessary
+# setwd("C:/Users/username/workingdir");
+
+# --------------------------------------------------------------------------
+# Here is your data from REVIGO. Scroll down for plot configuration options.
+
+revigo.names <- c("term_ID","description","freqInDbPercent","abslog10pvalue","uniqueness","dispensability","representative");
+revigo.data <- rbind(c("GO:0006412","translation",2.935,20.1500,0.634,0.000,"translation"),
+c("GO:0072521","purine-containing compound metabolic process",2.422,4.9031,0.649,0.600,"translation"),
+c("GO:0016072","rRNA metabolic process",0.893,5.0132,0.679,0.220,"translation"),
+c("GO:0006091","generation of precursor metabolites and energy",1.515,3.3034,0.855,0.110,"translation"),
+c("GO:0034660","ncRNA metabolic process",2.061,1.8413,0.721,0.298,"translation"),
+c("GO:0010499","proteasomal ubiquitin-independent protein catabolic process",0.019,2.6698,0.879,0.197,"translation"),
+c("GO:0006839","mitochondrial transport",1.220,1.9015,0.917,0.000,"mitochondrial transport"),
+c("GO:0070585","protein localization to mitochondrion",0.741,1.8413,0.897,0.207,"mitochondrial transport"),
+c("GO:0044743","intracellular protein transmembrane import",0.199,1.3928,0.854,0.440,"mitochondrial transport"),
+c("GO:1901796","regulation of signal transduction by p53 class mediator",0.271,1.6940,0.936,0.015,"regulation of signal transduction by p53 class mediator"),
+c("GO:0007005","mitochondrion organization",2.536,10.1373,0.820,0.020,"mitochondrion organization"),
+c("GO:0007007","inner mitochondrial membrane organization",0.100,2.3642,0.786,0.550,"mitochondrion organization"),
+c("GO:0071826","ribonucleoprotein complex subunit organization",0.978,6.2182,0.814,0.382,"mitochondrion organization"),
+c("GO:0000028","ribosomal small subunit assembly",0.081,4.6861,0.693,0.681,"mitochondrion organization"),
+c("GO:0042254","ribosome biogenesis",1.244,9.7773,0.699,0.438,"mitochondrion organization"),
+c("GO:0022613","ribonucleoprotein complex biogenesis",1.847,9.7773,0.796,0.364,"mitochondrion organization"),
+c("GO:0017004","cytochrome complex assembly",0.142,1.4575,0.768,0.571,"mitochondrion organization"),
+c("GO:0010257","NADH dehydrogenase complex assembly",0.090,9.7773,0.774,0.551,"mitochondrion organization"),
+c("GO:0032981","mitochondrial respiratory chain complex I assembly",0.090,9.7773,0.750,0.551,"mitochondrion organization"),
+c("GO:0033108","mitochondrial respiratory chain complex assembly",0.223,10.1373,0.735,0.339,"mitochondrion organization"),
+c("GO:0006626","protein targeting to mitochondrion",0.651,2.3039,0.712,0.643,"mitochondrion organization"),
+c("GO:0007338","single fertilization",0.617,1.5272,0.943,0.026,"single fertilization"),
+c("GO:0017144","drug metabolic process",0.085,3.8314,0.881,0.081,"drug metabolism"),
+c("GO:0022900","electron transport chain",0.366,9.3830,0.615,0.093,"electron transport chain"),
+c("GO:0055086","nucleobase-containing small molecule metabolic process",3.020,5.9747,0.529,0.576,"electron transport chain"),
+c("GO:0019646","aerobic electron transport chain",0.005,1.4201,0.677,0.530,"electron transport chain"),
+c("GO:0009123","nucleoside monophosphate metabolic process",1.263,8.9431,0.429,0.284,"electron transport chain"));
+
+stuff <- data.frame(revigo.data);
+names(stuff) <- revigo.names;
+
+stuff$abslog10pvalue <- as.numeric( as.character(stuff$abslog10pvalue) );
+stuff$freqInDbPercent <- as.numeric( as.character(stuff$freqInDbPercent) );
+stuff$uniqueness <- as.numeric( as.character(stuff$uniqueness) );
+stuff$dispensability <- as.numeric( as.character(stuff$dispensability) );
+
+# by default, outputs to a PDF file
+pdf( file="revigo_treemap.pdf", width=16, height=9 ) # width and height are in inches
+
+# check the tmPlot command documentation for all possible parameters - there are a lot more
+tmPlot(
+	stuff,
+	index = c("representative","description"),
+	vSize = "abslog10pvalue",
+	type = "categorical",
+	vColor = "representative",
+	title = "REVIGO Gene Ontology treemap",
+	inflate.labels = FALSE,      # set this to TRUE for space-filling group labels - good for posters
+	lowerbound.cex.labels = 0,   # try to draw as many labels as possible (still, some small squares may not get a label)
+	bg.labels = "#CCCCCCAA",     # define background color of group labels
+												       # "#CCCCCC00" is fully transparent, "#CCCCCCAA" is semi-transparent grey, NA is opaque
+	position.legend = "none"
+)
+
+dev.off()
+```
+
+"Report:"
+![REViGO GO tree map](./img/REViGO.png)
+
+Expression folds vs DE genes:
+```{r}
+barplot(sort(OE_foldchanges, decreasing = T), xaxt='n', xlab = "DE genes", ylab = "Expression", main = "DE genes overview")
+```
+
+```{r}
+KEGG_foldchanges <- DESeqResult[, c("entrezgene_id", "log2FoldChange")] %>%
+  # drop NaN
+  .[complete.cases(.),] # na.exclude(.) ?
+  
+# drop duplicated rows
+KEGG_foldchanges <- KEGG_foldchanges[which(duplicated(KEGG_foldchanges$entrezgene_id) == F), ]
+
+foldchanges <- KEGG_foldchanges$log2FoldChange
+
+names(foldchanges) <- KEGG_foldchanges$entrezgene_id
+
+foldchanges <- foldchanges %>% .[order(., decreasing = TRUE)]
+```
+
+"Perform the GSEA using KEGG gene sets:"
+```{r}
+## GSEA using gene sets from KEGG pathways
+
+# https://www.genome.jp/kegg/catalog/org_list.html
+
+gseaKEGG <- gseKEGG(geneList = foldchanges, # ordered named vector of fold changes (Entrez IDs are the associated names)
+              organism = "mmu", # supported organisms listed below
+              nPerm = 1000, # default number permutations
+              minGSSize = 20, # minimum gene set size (# genes in set) - change to test more sets or recover sets with fewer # genes
+              pvalueCutoff = 0.05, # padj cutoff value
+              verbose = FALSE)
+
+## Extract the GSEA results
+
+# View(gseaKEGG@result)
+```
+
+"Print some GSEA:"
+```{r}
+
+gseaKEGG@result[,1:4]
+```
+
+Plot the GSEA plot for a single enriched pathway:
+```{r}
+gseaplot(gseaKEGG, geneSetID = 'mmu03010')
+```
+## KEGG
+
+KEGG
+```{r}
+kk <- enrichKEGG(gene = names(foldchanges), organism = 'mmu')
+head(kk, n=10)[,1:6]
+
+# browseKEGG(kk, "mmu03010")
+```
+
+
+# SPIA
+```{r message=TRUE, warning=TRUE}
+pacman::p_load("SPIA")
+
+
+## Significant genes is a vector of fold changes where the names are ENTREZ gene IDs. The background set is a vector of all the genes represented on the platform.
+
+
+background_entrez <- annot[annot$ensembl_gene_id %in% all_genes,]$entrezgene_id %>% na.exclude(.)
+
+spia_result <- spia(de=foldchanges, all=background_entrez, organism="mmu")
+```
+
+
+"Print some SPIA:"
+```{r}
+spia_result
+```
+
+
+```{r}
+old_mar <- par("mar")
+par(mar=c(1,1,1,1))
+plotP(spia_result)
+```
+
+```{r}
+head(spia_result[order(spia_result$pNDE^2 + spia_result$pPERT^2, decreasing = FALSE),][,1:2])
+```
+# sigFeature: Significant Feature Selection by using SVM-RFE & t-statistic.
+
+"Let's rank those genes which can predict IVM MII 6wk samples"
+```{r}
+pacman::p_load("sigFeature")
+
+x <- df_norm[, sig_genes$row]
+
+# # y - vector of class labels -1 or 1's (for n samples/patients)
+y <- c()
+y[1: nrow(x)] <- -1
+y[grep("count_ivm_mii_6wk", rownames(x))] <- 1
+
+#Feature selection with sigFeature function.
+system.time(sigfeatureRankedList <- sigFeature(x,y))
+str(sigfeatureRankedList)
+```
+
+## PCA of top sorted normalized counts of DEG:
+
+"Those 80 genes have the greatest influence on the principal components and allow linear separation of IVM MII 6wk samples from others:"
+```{r}
+
+pca <-
+  prcomp(df_norm[,sig_genes$row[sigfeatureRankedList[1:80]]], scale. = TRUE)
+
+autoplot(pca, label = FALSE, size = 5, alpha = 0.8) + aes(color = sample_names) + scale_color_manual(
+  values = c(
+    "steelblue1",
+    "steelblue4",
+    "orchid1",
+    "orchid4",
+    "lightsalmon1",
+    "lightsalmon4"
+  )
+) + ggtitle("PCA of normalized values of top-80 DEG") + theme(plot.title = element_text(hjust = 0.5)) + guides(color=guide_legend(title="Samples:")) + geom_hline(yintercept=-0.2, linetype="dashed", 
+                color = "red", size=2) + geom_vline(xintercept=0, linetype="dashed", 
+                color = "red", size=2)
+```
+"Some clustering:"
+```{r}
+set.seed(4)
+
+autoplot(kmeans(pca$x, 2),
+data = pca$x,
+label = FALSE,
+frame = TRUE,
+size = 3) 
+# + aes(color = Samples)
+```
+
+"MDS (non liner embedding) of IVM MII 6wk samples also allows to separate IVM MII 6wk samples:"
+```{r}
+
+pacman::p_load("smacof", "scales")
+
+# rescale values between 0 and 1
+mds <- mds(delta = df_norm[,sig_genes$row[sigfeatureRankedList[1:80]]] %>% as.data.frame() %>% mutate_all(rescale), ndim = 2, type = "ratio")
+
+ggplot() + geom_point(
+  data = as.data.frame(mds$conf),
+  mapping = aes(x = -D1, y = -D2),
+  size = 5, alpha = 0.8
+) + aes(color = sample_names)  + scale_color_manual(
+  values = c(
+    "steelblue1",
+    "steelblue3",
+    "orchid1",
+    "orchid3",
+    "lightsalmon1",
+    "lightsalmon3"
+  )
+) +  ggtitle("MDS of normalized values of top-80 DEG") + theme(plot.title = element_text(hjust = 0.5)) + guides(color=guide_legend(title="Samples:")) + geom_vline(xintercept=0.2, linetype="dashed", 
+                color = "red", size=2)
+```
+
+"t-distributed stochastic neighbor embedding (t-SNE) - failed to separate"
+https://www.nature.com/articles/s41467-019-13056-x
+```{r}
+tsne(t(df_norm[,sig_genes$row[sigfeatureRankedList[1:80]]] %>% as.data.frame() %>% mutate_all(scale)), K = FALSE, labels = as.factor(sample_names), perplex = 5, printres = FALSE, seed = 42) + scale_color_manual(
+  values = c(
+    "steelblue1",
+    "steelblue3",
+    "orchid1",
+    "orchid3",
+    "lightsalmon1",
+    "lightsalmon3"
+  )
+)  + ggtitle("t-SNE of normalized selected values") + theme(plot.title = element_text(hjust = 0.5)) + guides(color=guide_legend(title="Samples:")) 
+```
+
+"Print those 80 genes which allow to distinguish IVM MII 6wk samples:"
+```{r}
+print(
+  head(DESeqResult %>% dplyr::filter(DESeqResult$ensembl_gene_id %in% sig_genes$row[sigfeatureRankedList[1:80]])
+  )
+)
+```
+
+# Genemania 
+```{r}
+
+dat = read.csv("genemania-genes.txt", header = TRUE, sep = "\t")
+
+names(dat)[1] <- "mgi_symbol"
+
+dat <- merge(dat, DESeqResult, by = "mgi_symbol")
+
+dat <- dat[base::order(dat$Score, decreasing = TRUE), ]
+
+pca <-
+  prcomp(df_norm[, dat$ensembl_gene_id[1:7] ], scale. = TRUE)
+
+autoplot(pca, label = FALSE, size = 5, alpha = 0.8) + aes(color = sample_names) + scale_color_manual(
+  values = c(
+    "steelblue1",
+    "steelblue4",
+    "orchid1",
+    "orchid4",
+    "lightsalmon1",
+    "lightsalmon4"
+  )
+) + ggtitle("PCA of normalized values of top-7 DEG (based on Genemania score)") + theme(plot.title = element_text(hjust = 0.5)) + guides(color=guide_legend(title="Samples:")) + geom_hline(yintercept=0, linetype="dashed", 
+                color = "red", size=2) + geom_vline(xintercept=0, linetype="dashed", 
+                color = "red", size=2)
+```
